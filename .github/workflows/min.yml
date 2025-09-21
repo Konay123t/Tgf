@@ -1,0 +1,115 @@
+name: Windows 11 RDP with Unlimited Time
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_hours:
+        description: 'Hours to keep RDP active (0 for unlimited)'
+        required: false
+        default: '0'
+        type: string
+
+env:
+  RDP_USER: "GitHubRDPUser"
+  MAX_TIMEOUT: 999999 # GitHub's maximum timeout limit
+
+jobs:
+  setup-windows-rdp:
+    runs-on: windows-11  # Windows 11 runner
+    timeout-minutes: ${{ fromJSON(format('{0}', github.event.inputs.timeout_hours == '0' && env.MAX_TIMEOUT || github.event.inputs.timeout_hours * 60)) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure RDP settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          
+          # Configure RDP security settings
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 1
+          
+          # Configure firewall to allow RDP
+          netsh advfirewall firewall set rule group="Remote Desktop" new enable=Yes
+          
+          # Restart Remote Desktop services
+          Restart-Service -Name "TermService" -Force
+
+      - name: Create RDP user with secure password
+        run: |
+          # Generate a strong random password
+          Add-Type -AssemblyName System.Web
+          $password = [System.Web.Security.Membership]::GeneratePassword(24, 6)
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create new user
+          New-LocalUser -Name "$env:RDP_USER" -Password $securePassword -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:RDP_USER"
+          
+          # Store credentials securely
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "RDP user created: $env:RDP_USER"
+
+      - name: Get public IP address
+        id: ip
+        run: |
+          $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
+          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+          Write-Host "Public IP: $publicIP"
+
+      - name: Setup auto-login and keep-alive
+        run: |
+          # Disable screen lock and sleep
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -standby-timeout-dc 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -monitor-timeout-dc 0
+          
+          # Disable screensaver
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ScreenSaveActive" -Value "0"
+          
+          # Keep system awake
+          Write-Host "Preventing system from sleeping..."
+
+      - name: Display RDP connection information
+        run: |
+          Write-Host "=============================================="
+          Write-Host "RDP CONNECTION INFORMATION"
+          Write-Host "=============================================="
+          Write-Host "IP Address: $env:PUBLIC_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "=============================================="
+          Write-Host "Use Microsoft Remote Desktop to connect to the above IP"
+          Write-Host "This RDP session will remain active for: ${{ github.event.inputs.timeout_hours == '0' && 'Unlimited' || format('{0} hours', github.event.inputs.timeout_hours) }}"
+          Write-Host "=============================================="
+
+      - name: Keep runner active
+        run: |
+          # Calculate timeout (0 means unlimited)
+          $timeoutHours = ${{ github.event.inputs.timeout_hours }}
+          $endTime = if ($timeoutHours -eq 0) { [DateTime]::MaxValue } else { (Get-Date).AddHours($timeoutHours) }
+          
+          Write-Host "RDP session started at: $(Get-Date)"
+          Write-Host "Expected end time: $(if ($timeoutHours -eq 0) { 'Never (until manually stopped)' } else { $endTime })"
+          
+          # Keep the runner active
+          while ((Get-Date) -lt $endTime) {
+              Write-Host "[$(Get-Date)] RDP session active - Use Ctrl+C in workflow to terminate"
+              
+              # Verify RDP is still accessible
+              $rdpStatus = Get-Service -Name "TermService"
+              if ($rdpStatus.Status -ne "Running") {
+                  Write-Host "RDP service not running, restarting..."
+                  Start-Service -Name "TermService"
+              }
+              
+              # Sleep for 5 minutes before next check
+              Start-Sleep -Seconds 300
+          }
+          
+          Write-Host "RDP session completed at: $(Get-Date)"
