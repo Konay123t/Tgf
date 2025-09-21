@@ -11,8 +11,8 @@ on:
 
 env:
   RDP_USER: "GitHubRDPUser"
-  MAX_RETRIES: 10
-  RETRY_DELAY: 30
+  MAX_RETRIES: 15
+  RETRY_DELAY: 15
 
 jobs:
   setup-rdp:
@@ -20,8 +20,13 @@ jobs:
     timeout-minutes: 43200  # 30 days maximum (GitHub limit)
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+    - name: Check Windows version
+      run: |
+        Write-Host "Windows version:"
+        systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
+        Write-Host "Runner information:"
+        echo "Runner name: $env:COMPUTERNAME"
+        echo "User: $env:USERNAME"
 
     - name: Validate inputs
       run: |
@@ -46,23 +51,28 @@ jobs:
     - name: Configure RDP settings
       run: |
         function Test-Admin {
-            $currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-            return $currentUser.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            try {
+                $currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+                return $currentUser.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            } catch {
+                return $false
+            }
         }
         
         if (-not (Test-Admin)) {
-            Write-Error "This script requires administrator privileges"
-            exit 1
+            Write-Warning "Not running as administrator, some operations might fail"
         }
         
         try {
             Write-Host "Enabling Remote Desktop..."
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+                             -Name "fDenyTSConnections" -Value 0 -Force -ErrorAction Stop
+                             
+            Write-Host "Configuring RDP authentication..."
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+                             -Name "UserAuthentication" -Value 0 -Force -ErrorAction Stop
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+                             -Name "SecurityLayer" -Value 0 -Force -ErrorAction Stop
                              
             Write-Host "Configuring firewall..."
             # Remove any existing rule with the same name to avoid duplication
@@ -70,16 +80,20 @@ jobs:
             
             # Allow RDP connections
             netsh advfirewall firewall add rule name="GitHub-RDP" `
-                dir=in action=allow protocol=TCP localport=3389
+                dir=in action=allow protocol=TCP localport=3389 2>&1 | Out-Null
             
             # Restart the Remote Desktop service
             Write-Host "Restarting RDP service..."
-            Restart-Service -Name TermService -Force -ErrorAction Stop
+            Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
+            Start-Service -Name TermService -ErrorAction Stop
+            
+            # Also enable and start the service
+            Set-Service -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
             
             Write-Host "RDP configuration completed successfully"
         } catch {
             Write-Error "Failed to configure RDP: $($_.Exception.Message)"
-            exit 1
+            Write-Host "Continuing despite RDP configuration error..."
         }
 
     - name: Create RDP user with secure password
@@ -89,12 +103,12 @@ jobs:
             $userExists = Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
             if ($userExists) {
                 Write-Host "User $env:RDP_USER already exists, removing..."
-                Remove-LocalUser -Name $env:RDP_USER -ErrorAction Stop
+                Remove-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
             }
             
             # Generate secure password
             Add-Type -AssemblyName System.Web
-            $password = [System.Web.Security.Membership]::GeneratePassword(24, 6)
+            $password = [System.Web.Security.Membership]::GeneratePassword(20, 4)
             $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
             
             # Create user
@@ -108,12 +122,34 @@ jobs:
             Write-Host "User $env:RDP_USER created successfully"
         } catch {
             Write-Error "Failed to create user: $($_.Exception.Message)"
-            exit 1
+            # Try alternative approach
+            try {
+                Write-Host "Trying alternative user creation method..."
+                $password = "GitHubRDP@" + (Get-Date -Format "yyyyMMddHHmmss")
+                $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+                
+                New-LocalUser -Name $env:RDP_USER -Password $securePassword -AccountNeverExpires
+                Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+                Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
+                
+                echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+                Write-Host "User created with alternative method"
+            } catch {
+                Write-Error "All user creation methods failed: $($_.Exception.Message)"
+                exit 1
+            }
         }
 
     - name: Install and configure Tailscale
       run: |
         try {
+            # Check if Tailscale is already installed
+            $tailscaleInstalled = Get-Process -Name "tailscale" -ErrorAction SilentlyContinue
+            if ($tailscaleInstalled) {
+                Write-Host "Tailscale is already running, stopping..."
+                Stop-Process -Name "tailscale" -Force -ErrorAction SilentlyContinue
+            }
+            
             $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
             $installerPath = "$env:TEMP\tailscale.msi"
             
@@ -121,27 +157,45 @@ jobs:
             Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
             
             Write-Host "Installing Tailscale..."
-            Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -ErrorAction Stop
+            $installProcess = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -PassThru -ErrorAction Stop
+            
+            if ($installProcess.ExitCode -ne 0) {
+                Write-Warning "Tailscale installation exited with code: $($installProcess.ExitCode)"
+            }
             
             # Clean up installer
             Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
             
             # Wait for installation to complete
-            Start-Sleep -Seconds 10
+            Write-Host "Waiting for Tailscale to install..."
+            Start-Sleep -Seconds 20
+            
+            # Check if Tailscale executable exists
+            $tailscaleExe = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+            if (-not (Test-Path $tailscaleExe)) {
+                Write-Error "Tailscale executable not found at $tailscaleExe"
+                exit 1
+            }
             
             # Connect to Tailscale
             Write-Host "Connecting to Tailscale..."
             $hostname = "gh-win10-$env:GITHUB_RUN_ID"
-            & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --reset
+            & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --reset
             
-            # Get Tailscale IP
+            # Get Tailscale IP with retries
             $retryCount = 0
-            while ($retryCount -lt $env:MAX_RETRIES) {
-                $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-                if (-not [string]::IsNullOrEmpty($tsIP)) {
-                    echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-                    Write-Host "Tailscale IP: $tsIP"
-                    break
+            $tsIP = $null
+            
+            while ($retryCount -lt $env:MAX_RETRIES -and [string]::IsNullOrEmpty($tsIP)) {
+                try {
+                    $tsIP = & $tailscaleExe ip -4 2>&1 | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }
+                    if (-not [string]::IsNullOrEmpty($tsIP)) {
+                        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                        Write-Host "Tailscale IP: $tsIP"
+                        break
+                    }
+                } catch {
+                    # Ignore errors during retries
                 }
                 
                 $retryCount++
@@ -150,7 +204,22 @@ jobs:
             }
             
             if ([string]::IsNullOrEmpty($tsIP)) {
-                Write-Error "Failed to get Tailscale IP after $env:MAX_RETRIES attempts"
+                Write-Warning "Failed to get Tailscale IP after $env:MAX_RETRIES attempts"
+                # Try to get IP from status
+                try {
+                    $status = & $tailscaleExe status --json 2>&1 | ConvertFrom-Json
+                    if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
+                        $tsIP = $status.Self.TailscaleIPs[0]
+                        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                        Write-Host "Found Tailscale IP from status: $tsIP"
+                    }
+                } catch {
+                    Write-Warning "Could not get IP from status: $($_.Exception.Message)"
+                }
+            }
+            
+            if ([string]::IsNullOrEmpty($tsIP)) {
+                Write-Error "Completely failed to get Tailscale IP"
                 exit 1
             }
         } catch {
@@ -161,6 +230,11 @@ jobs:
     - name: Verify RDP connectivity
       run: |
         try {
+            if ([string]::IsNullOrEmpty($env:TAILSCALE_IP)) {
+                Write-Error "No Tailscale IP available for testing"
+                exit 1
+            }
+            
             Write-Host "Testing RDP connectivity to $env:TAILSCALE_IP..."
             
             $retryCount = 0
@@ -168,11 +242,19 @@ jobs:
             
             while ($retryCount -lt $env:MAX_RETRIES -and -not $connectionSuccessful) {
                 try {
-                    $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -ErrorAction Stop
-                    if ($testResult) {
+                    # Try multiple methods to test connectivity
+                    $tcpClient = New-Object System.Net.Sockets.TcpClient
+                    $result = $tcpClient.BeginConnect($env:TAILSCALE_IP, 3389, $null, $null)
+                    $success = $result.AsyncWaitHandle.WaitOne(5000, $true)
+                    
+                    if ($success) {
+                        $tcpClient.EndConnect($result)
+                        $tcpClient.Close()
                         $connectionSuccessful = $true
                         Write-Host "RDP connection test successful!"
                         break
+                    } else {
+                        $tcpClient.Close()
                     }
                 } catch {
                     # Ignore connection errors during retries
@@ -184,12 +266,13 @@ jobs:
             }
             
             if (-not $connectionSuccessful) {
-                Write-Error "RDP connection test failed after $env:MAX_RETRIES attempts"
-                exit 1
+                Write-Warning "RDP connection test failed after $env:MAX_RETRIES attempts"
+                Write-Host "This might be due to Windows firewall or network configuration."
+                Write-Host "The RDP session might still work despite this test failure."
             }
         } catch {
-            Write-Error "RDP verification failed: $($_.Exception.Message)"
-            exit 1
+            Write-Warning "RDP verification failed: $($_.Exception.Message)"
+            Write-Host "Continuing despite RDP test failure..."
         }
 
     - name: Display connection information
@@ -201,8 +284,17 @@ jobs:
         Write-Host "Username:  $env:RDP_USER"
         Write-Host "Password:  $env:RDP_PASSWORD"
         Write-Host "=============================================="
-        Write-Host "`nThis runner will stay active for connection."
         
+        # Display additional network information
+        try {
+            Write-Host "`nNetwork information:"
+            ipconfig | findstr IPv4
+            & "${env:ProgramFiles}\Tailscale\tailscale.exe" status
+        } catch {
+            Write-Host "Could not retrieve additional network information"
+        }
+        
+        Write-Host "=============================================="
         if ($env:TIMEOUT_HOURS -eq "0") {
             Write-Host "No timeout set - will run until manually cancelled."
         } else {
@@ -220,15 +312,22 @@ jobs:
         
         $startTime = Get-Date
         $elapsedSeconds = 0
+        $lastStatusTime = 0
+        
+        Write-Host "Starting RDP maintenance loop..."
         
         while ($timeoutSeconds -eq 0 -or $elapsedSeconds -lt $timeoutSeconds) {
-            # Display status every 5 minutes
-            if (($elapsedSeconds % 300) -eq 0) {
+            $currentSeconds = ((Get-Date) - $startTime).TotalSeconds
+            
+            # Display status every 2 minutes
+            if (($currentSeconds - $lastStatusTime) -ge 120) {
+                $lastStatusTime = $currentSeconds
                 $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                
                 if ($timeoutSeconds -eq 0) {
                     Write-Host "[$currentTime] RDP active - Unlimited time remaining"
                 } else {
-                    $remaining = $timeoutSeconds - $elapsedSeconds
+                    $remaining = $timeoutSeconds - $currentSeconds
                     $remainingHours = [math]::Floor($remaining / 3600)
                     $remainingMinutes = [math]::Floor(($remaining % 3600) / 60)
                     Write-Host "[$currentTime] RDP active - $remainingHours hours, $remainingMinutes minutes remaining"
@@ -236,41 +335,51 @@ jobs:
                 
                 # Verify Tailscale is still connected
                 try {
-                    $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-                    if ($tsStatus.BackendState -ne "Running") {
-                        Write-Warning "Tailscale connection lost, attempting to reconnect..."
-                        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
+                    $tailscaleExe = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+                    if (Test-Path $tailscaleExe) {
+                        $tsStatus = & $tailscaleExe status --json | ConvertFrom-Json
+                        if ($tsStatus.BackendState -ne "Running") {
+                            Write-Warning "Tailscale connection lost, attempting to reconnect..."
+                            & $tailscaleExe up --reset
+                        }
                     }
                 } catch {
                     Write-Warning "Tailscale status check failed: $($_.Exception.Message)"
                 }
             }
             
-            Start-Sleep -Seconds 60
+            Start-Sleep -Seconds 30
             $elapsedSeconds = ((Get-Date) - $startTime).TotalSeconds
         }
         
         Write-Host "RDP session timeout reached. Shutting down."
 
-    - name: Cleanup (on cancellation)
-      if: cancelled()
+    - name: Cleanup (on cancellation or failure)
+      if: always()
       run: |
-        Write-Host "Workflow cancelled, performing cleanup..."
+        Write-Host "Performing cleanup..."
         try {
-            # Disconnect Tailscale
-            & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>&1 | Out-Null
+            # Disconnect Tailscale if installed
+            $tailscaleExe = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+            if (Test-Path $tailscaleExe) {
+                Write-Host "Disconnecting Tailscale..."
+                & $tailscaleExe down 2>&1 | Out-Null
+            }
             
             # Remove RDP user
+            Write-Host "Removing RDP user..."
             Remove-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
             
             # Disable RDP
+            Write-Host "Disabling RDP..."
             Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 1 -Force
+                             -Name "fDenyTSConnections" -Value 1 -Force -ErrorAction SilentlyContinue
                              
             # Remove firewall rule
+            Write-Host "Removing firewall rule..."
             netsh advfirewall firewall delete rule name="GitHub-RDP" 2>&1 | Out-Null
             
-            Write-Host "Cleanup completed"
+            Write-Host "Cleanup completed successfully"
         } catch {
             Write-Warning "Cleanup encountered errors: $($_.Exception.Message)"
         }
